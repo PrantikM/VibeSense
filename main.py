@@ -4,7 +4,7 @@ from transformers import AutoModelForSequenceClassification, Trainer, TrainingAr
 
 from datasets import load_dataset
 
-dataset = load_dataset("train.tsv")
+dataset = load_dataset("goemotions_1.csv")
 
 dialog_data = load_dataset("train.csv")
 
