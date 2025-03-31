@@ -4,9 +4,9 @@ from transformers import AutoModelForSequenceClassification, Trainer, TrainingAr
 
 from datasets import load_dataset
 
-dataset = load_dataset("goemotions_1.csv")
+dataset = load_dataset("go_emotions")
 
-dialog_data = load_dataset("train.csv")
+dialog_data = load_dataset("daily_dialog")
 
 from transformers import AutoTokenizer
 
