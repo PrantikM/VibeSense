@@ -12,7 +12,7 @@ from transformers import (
 )
 import torch
 from torch.utils.data import DataLoader
-import evaluate
+from sklearn.metrics import accuracy_score, f1_score
 import argparse
 import logging
 
@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="roberta-base",
+        default="distilroberta-base",  # Smaller model for faster training
         help="Model identifier from Hugging Face model hub"
     )
     parser.add_argument(
@@ -50,19 +50,19 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=32,  # Increased batch size for faster training
         help="Batch size for training and evaluation"
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=3,
+        default=1,  # Reduced to just 1 epoch
         help="Number of training epochs"
     )
     parser.add_argument(
         "--max_length",
         type=int,
-        default=128,
+        default=64,  # Reduced sequence length
         help="Maximum sequence length"
     )
     parser.add_argument(
@@ -71,11 +71,17 @@ def parse_args():
         default=42,
         help="Random seed"
     )
+    parser.add_argument(
+        "--dataset_fraction",
+        type=float,
+        default=0.1,  # Only use 10% of the dataset
+        help="Fraction of the dataset to use (0.0-1.0)"
+    )
     return parser.parse_args()
 
-def load_goemotions_dataset():
+def load_goemotions_dataset(dataset_fraction=0.1):
     """Load and prepare the GoEmotions dataset."""
-    logger.info("Loading GoEmotions dataset...")
+    logger.info(f"Loading {dataset_fraction*100}% of GoEmotions dataset...")
 
     # Load the dataset from Hugging Face datasets
     dataset = load_dataset("go_emotions")
@@ -88,6 +94,20 @@ def load_goemotions_dataset():
         'joy', 'love', 'nervousness', 'optimism', 'pride', 'realization',
         'relief', 'remorse', 'sadness', 'surprise', 'neutral'
     ]
+
+    # Reduce dataset size
+    train_size = int(len(dataset["train"]) * dataset_fraction)
+    validation_size = int(len(dataset["validation"]) * dataset_fraction)
+    test_size = int(len(dataset["test"]) * dataset_fraction)
+
+    logger.info(f"Reduced train size: {train_size}, validation size: {validation_size}, test size: {test_size}")
+
+    # Sample the datasets
+    reduced_dataset = {
+        "train": dataset["train"].select(range(train_size)),
+        "validation": dataset["validation"].select(range(validation_size)),
+        "test": dataset["test"].select(range(test_size))
+    }
 
     # Convert multi-label format to the format needed for training
     def preprocess_function(examples):
@@ -104,14 +124,15 @@ def load_goemotions_dataset():
         }
 
     # Apply preprocessing
-    processed_dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-    )
+    processed_dataset = {}
+    for split in reduced_dataset:
+        processed_dataset[split] = reduced_dataset[split].map(
+            preprocess_function,
+            batched=True,
+            remove_columns=dataset[split].column_names,
+        )
 
-    # Map from multi-label to single-label for simplicity in this example
-    # (in practice, you might want to keep it multi-label)
+    # Map from multi-label to single-label for simplicity
     def convert_to_single_label(example):
         if sum(example["labels"]) == 0:
             # If no emotion, default to neutral (last index)
@@ -121,13 +142,15 @@ def load_goemotions_dataset():
             example["label"] = np.argmax(example["labels"])
         return example
 
-    single_label_dataset = processed_dataset.map(convert_to_single_label)
+    single_label_dataset = {}
+    for split in processed_dataset:
+        single_label_dataset[split] = processed_dataset[split].map(convert_to_single_label)
 
     return single_label_dataset, emotions
 
-def load_dailydialog_dataset():
+def load_dailydialog_dataset(dataset_fraction=0.1):
     """Load and prepare the DailyDialog dataset."""
-    logger.info("Loading DailyDialog dataset...")
+    logger.info(f"Loading {dataset_fraction*100}% of DailyDialog dataset...")
 
     # Load the dataset from Hugging Face datasets
     dataset = load_dataset("daily_dialog")
@@ -154,29 +177,35 @@ def load_dailydialog_dataset():
         return {"text": texts, "label": labels}
 
     # Apply preprocessing
-    processed_dataset = dataset.map(
-        extract_utterances,
-        batched=True,
-        remove_columns=dataset["train"].column_names
-    )
+    processed_dataset = {}
+    for split in dataset:
+        processed_split = dataset[split].map(
+            extract_utterances,
+            batched=True,
+            remove_columns=dataset[split].column_names
+        )
+
+        # Reduce dataset size
+        dataset_size = int(len(processed_split) * dataset_fraction)
+        processed_dataset[split] = processed_split.select(range(dataset_size))
+        logger.info(f"Reduced {split} size: {dataset_size}")
 
     return processed_dataset, emotions
 
 def compute_metrics(eval_pred):
-    """Compute metrics for evaluation."""
+    """Compute metrics for evaluation using scikit-learn."""
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
 
-    accuracy_metric = evaluate.load("accuracy")
-    accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
+    # Calculate accuracy
+    accuracy = accuracy_score(labels, predictions)
 
-    f1_metric = evaluate.load("f1")
-    # For multi-class, use macro average
-    f1 = f1_metric.compute(predictions=predictions, references=labels, average="macro")
+    # Calculate F1 score (macro average for multi-class)
+    f1 = f1_score(labels, predictions, average="macro")
 
     return {
-        "accuracy": accuracy["accuracy"],
-        "f1": f1["f1"],
+        "accuracy": accuracy,
+        "f1": f1,
     }
 
 def fine_tune_model(args):
@@ -187,14 +216,15 @@ def fine_tune_model(args):
 
     # Load dataset
     if args.dataset == "goemotions":
-        dataset, label_names = load_goemotions_dataset()
+        dataset, label_names = load_goemotions_dataset(args.dataset_fraction)
     else:  # dailydialog
-        dataset, label_names = load_dailydialog_dataset()
+        dataset, label_names = load_dailydialog_dataset(args.dataset_fraction)
 
     num_labels = len(label_names)
     logger.info(f"Number of emotion labels: {num_labels}")
 
     # Load tokenizer and model
+    logger.info(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
@@ -211,12 +241,14 @@ def fine_tune_model(args):
             max_length=args.max_length
         )
 
-    tokenized_dataset = dataset.map(tokenize_function, batched=True)
+    tokenized_dataset = {}
+    for split in dataset:
+        tokenized_dataset[split] = dataset[split].map(tokenize_function, batched=True)
 
     # Prepare data collator
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # Define training arguments
+    # Define training arguments with more logging and savings
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
@@ -224,11 +256,16 @@ def fine_tune_model(args):
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.num_epochs,
         weight_decay=0.01,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+        evaluation_strategy="steps",
+        eval_steps=100,  # Evaluate every 100 steps
+        save_strategy="steps",
+        save_steps=100,   # Save every 100 steps
+        save_total_limit=2,  # Only keep the 2 most recent checkpoints
         load_best_model_at_end=True,
         push_to_hub=False,
         report_to="none",  # Disable wandb, tensorboard etc.
+        logging_dir=os.path.join(args.output_dir, "logs"),
+        logging_steps=10,  # Log every 10 steps for more visibility
     )
 
     # Initialize Trainer
@@ -243,7 +280,7 @@ def fine_tune_model(args):
     )
 
     # Train the model
-    logger.info("Starting model fine-tuning...")
+    logger.info("Starting model fine-tuning with reduced dataset...")
     trainer.train()
 
     # Evaluate the model
@@ -267,6 +304,8 @@ def main():
     args = parse_args()
     fine_tuned_model_path = fine_tune_model(args)
     logger.info(f"Model fine-tuning complete. Model saved to: {fine_tuned_model_path}")
+    logger.info("Since we used a reduced dataset and fewer epochs, the model may not be optimal.")
+    logger.info("However, it should still provide reasonable results for your Chrome extension.")
 
 if __name__ == "__main__":
     main()
